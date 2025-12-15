@@ -25,6 +25,7 @@ import {
   ledger
 } from "../managed/counter/contract/index.cjs";
 import { type CounterPrivateState, witnesses } from "../witnesses.js";
+import { encodeCoinPublicKey } from "@midnight-ntwrk/onchain-runtime";
 
 // This is over-kill for such a simple contract, but the same pattern can be used to test more
 // complex contracts.
@@ -32,14 +33,14 @@ export class CounterSimulator {
   readonly contract: Contract<CounterPrivateState>;
   circuitContext: CircuitContext<CounterPrivateState>;
 
-  constructor() {
+  constructor(coinPublicKey = "0".repeat(64)) {
     this.contract = new Contract<CounterPrivateState>(witnesses);
     const {
       currentPrivateState,
       currentContractState,
       currentZswapLocalState
     } = this.contract.initialState(
-      constructorContext({ privateCounter: 0 }, "0".repeat(64))
+      constructorContext({ privateCounter: 0 }, coinPublicKey)
     );
     this.circuitContext = {
       currentPrivateState,
@@ -60,7 +61,17 @@ export class CounterSimulator {
     return this.circuitContext.currentPrivateState;
   }
 
-  public increment(): Ledger {
+  public setSigner(coinPublicKey: string): void {
+    this.circuitContext.currentZswapLocalState = {
+      ...this.circuitContext.currentZswapLocalState,
+      coinPublicKey: { bytes: encodeCoinPublicKey(coinPublicKey) }
+    };
+  }
+
+  public increment(coinPublicKey?: string): Ledger {
+    if (coinPublicKey !== undefined) {
+      this.setSigner(coinPublicKey);
+    }
     // Update the current context to be the result of executing the circuit.
     this.circuitContext = this.contract.impureCircuits.increment(
       this.circuitContext

@@ -13,14 +13,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pragma language_version >= 0.16 && <= 0.18;
+pragma language_version >= 0.16;
 
 import CompactStandardLibrary;
 
 // public state
-export ledger round: Counter;
+export ledger counters: Map<ZswapCoinPublicKey, Counter>;
 
 // transition function changing public state
 export circuit increment(): [] {
-  round.increment(1);
+  const caller = ownPublicKey();
+  if (!counters.member(caller)) {
+    counters.insertDefault(caller);
+  }
+  counters.lookup(caller).increment(1);
 }

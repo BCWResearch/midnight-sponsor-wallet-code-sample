@@ -67,7 +67,7 @@ const deployOrJoin = async (providers: CounterProviders, rli: Interface): Promis
   }
 };
 
-const mainLoop = async (providers: CounterProviders, rli: Interface): Promise<void> => {
+const mainLoop = async (providers: CounterProviders, rli: Interface, config: Config): Promise<void> => {
   const counterContract = await deployOrJoin(providers, rli);
   if (counterContract === null) {
     return;
@@ -76,10 +76,27 @@ const mainLoop = async (providers: CounterProviders, rli: Interface): Promise<vo
     const choice = await rli.question(MAIN_LOOP_QUESTION);
     switch (choice) {
       case '1':
-        await api.increment(counterContract);
+        {
+          const seed = await rli.question(
+            'Enter private seed to sign increment (leave empty to use current wallet): ',
+          );
+          if (seed.trim().length > 0) {
+            const proverWallet = await api.buildProverWalletFromSeed(config, seed.trim());
+            await api.setExternalProverWallet(proverWallet);
+          } else {
+            await api.setExternalProverWallet(null);
+          }
+          await api.increment(counterContract);
+        }
         break;
       case '2':
-        await api.displayCounterValue(providers, counterContract);
+        {
+          const addr = await rli.question(
+            'Enter wallet public address (mn_shield-*, shield-cpk, hex) or press enter to use your own: ',
+          );
+          const targetAddress = addr.trim().length === 0 ? undefined : addr.trim();
+          await api.displayCounterValue(providers, counterContract, targetAddress);
+        }
         break;
       case '3':
         logger.info('Exiting...');
@@ -150,7 +167,7 @@ export const run = async (config: Config, _logger: Logger, dockerEnv?: DockerCom
   try {
     if (wallet !== null) {
       const providers = await api.configureProviders(wallet, config);
-      await mainLoop(providers, rli);
+      await mainLoop(providers, rli, config);
     }
   } catch (e) {
     if (e instanceof Error) {

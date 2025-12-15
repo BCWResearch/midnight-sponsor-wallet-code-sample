@@ -17,7 +17,14 @@
 /* eslint-disable @typescript-eslint/no-unsafe-member-access */
 import { type ContractAddress } from '@midnight-ntwrk/compact-runtime';
 import { Counter, type CounterPrivateState, witnesses } from '@midnight-ntwrk/counter-contract';
-import { type CoinInfo, nativeToken, Transaction, type TransactionId } from '@midnight-ntwrk/ledger';
+import {
+  type CoinInfo,
+  nativeToken,
+  Transaction,
+  type TransactionId,
+  type CoinPublicKey,
+  type EncPublicKey,
+} from '@midnight-ntwrk/ledger';
 import { deployContract, findDeployedContract } from '@midnight-ntwrk/midnight-js-contracts';
 import { httpClientProofProvider } from '@midnight-ntwrk/midnight-js-http-client-proof-provider';
 import { indexerPublicDataProvider } from '@midnight-ntwrk/midnight-js-indexer-public-data-provider';
@@ -43,14 +50,18 @@ import {
   type CounterProviders,
   type DeployedCounterContract,
 } from './common-types';
-import { type Config, contractConfig } from './config';
+import { type Config, contractConfig, TestnetRemoteConfig } from './config';
 import { levelPrivateStateProvider } from '@midnight-ntwrk/midnight-js-level-private-state-provider';
 import { assertIsContractAddress, toHex } from '@midnight-ntwrk/midnight-js-utils';
 import { getLedgerNetworkId, getZswapNetworkId } from '@midnight-ntwrk/midnight-js-network-id';
+import { encodeCoinPublicKey } from '@midnight-ntwrk/onchain-runtime';
+import { MidnightBech32m, ShieldedAddress, ShieldedCoinPublicKey } from '@midnight-ntwrk/wallet-sdk-address-format';
 import * as fsAsync from 'node:fs/promises';
 import * as fs from 'node:fs';
 
 let logger: Logger;
+let externalProverWallet: (Wallet & Resource) | null = null;
+let overrideKeys: { coinPublicKey?: CoinPublicKey; encryptionPublicKey?: EncPublicKey } = {};
 // Instead of setting globalThis.crypto which is read-only, we'll ensure crypto is available
 // but won't try to overwrite the global property
 // @ts-expect-error: It's needed to enable WebSocket usage through apollo
@@ -59,12 +70,70 @@ globalThis.WebSocket = WebSocket;
 export const getCounterLedgerState = async (
   providers: CounterProviders,
   contractAddress: ContractAddress,
+  coinPublicKey?: string | Uint8Array,
 ): Promise<bigint | null> => {
   assertIsContractAddress(contractAddress);
   logger.info('Checking contract ledger state...');
+  const parseWalletAddress = (address: string): Uint8Array | undefined => {
+    try {
+      const parsed = MidnightBech32m.parse(address as `${string}1${string}`);
+      if (parsed.type === 'shield-addr') {
+        const decoded = ShieldedAddress.codec.decode(getZswapNetworkId(), parsed);
+        return decoded.coinPublicKey.data;
+      }
+      if (parsed.type === 'shield-cpk') {
+        return ShieldedCoinPublicKey.codec.decode(getZswapNetworkId(), parsed).data;
+      }
+    } catch (e) {
+      logger.warn(`Unable to decode wallet address '${address}': ${(e as Error).message}`);
+    }
+    return undefined;
+  };
+
+  const encodeKey = (key?: string | Uint8Array): Uint8Array | undefined => {
+    if (!key) return undefined;
+    if (key instanceof Uint8Array) return key;
+
+    // bech32 wallet address or coin public key
+    const bech32Key = parseWalletAddress(key);
+    if (bech32Key !== undefined) {
+      return bech32Key;
+    }
+
+    // hex fallback
+    const normalized = key.length % 2 === 1 ? `0${key}` : key;
+    try {
+      return encodeCoinPublicKey(normalized);
+    } catch (e) {
+      logger.warn(`Unable to encode key '${key}': ${(e as Error).message}`);
+      return undefined;
+    }
+  };
+
+  const providerKey = providers.walletProvider.coinPublicKey;
+  const providerEncKey = providers.walletProvider.encryptionPublicKey;
+  console.log('coinPublicKey', coinPublicKey);
+  console.log('providerKey', providerKey);
+  console.log('providerEncKey', providerEncKey);
+  const keyBytes = encodeKey(coinPublicKey) ?? encodeKey(providerKey) ?? encodeKey(providerEncKey);
+  if (keyBytes === undefined) {
+    logger.warn('No usable public key available to query counters');
+    return null;
+  }
+  const encodedKey = { bytes: keyBytes };
+  console.log('encodedKey', encodedKey);
   const state = await providers.publicDataProvider
     .queryContractState(contractAddress)
-    .then((contractState) => (contractState != null ? Counter.ledger(contractState.data).round : null));
+    .then((contractState) => {
+      if (contractState == null) {
+        return null;
+      }
+      const counters = Counter.ledger(contractState.data).counters;
+      if (!counters.member(encodedKey)) {
+        return 0n;
+      }
+      return counters.lookup(encodedKey).read();
+    });
   logger.info(`Ledger state: ${state}`);
   return state;
 };
@@ -109,9 +178,10 @@ export const increment = async (counterContract: DeployedCounterContract): Promi
 export const displayCounterValue = async (
   providers: CounterProviders,
   counterContract: DeployedCounterContract,
+  coinPublicKey?: string | Uint8Array,
 ): Promise<{ counterValue: bigint | null; contractAddress: string }> => {
   const contractAddress = counterContract.deployTxData.public.contractAddress;
-  const counterValue = await getCounterLedgerState(providers, contractAddress);
+  const counterValue = await getCounterLedgerState(providers, contractAddress, coinPublicKey);
   if (counterValue === null) {
     logger.info(`There is no counter contract deployed at ${contractAddress}.`);
   } else {
@@ -122,16 +192,25 @@ export const displayCounterValue = async (
 
 export const createWalletAndMidnightProvider = async (wallet: Wallet): Promise<WalletProvider & MidnightProvider> => {
   const state = await Rx.firstValueFrom(wallet.state());
+  const baseCoinPublicKey = state.coinPublicKey;
+  const baseEncryptionPublicKey = state.encryptionPublicKey;
   return {
-    coinPublicKey: state.coinPublicKey,
-    encryptionPublicKey: state.encryptionPublicKey,
+    get coinPublicKey() {
+      return overrideKeys.coinPublicKey ?? baseCoinPublicKey;
+    },
+    get encryptionPublicKey() {
+      return overrideKeys.encryptionPublicKey ?? baseEncryptionPublicKey;
+    },
     balanceTx(tx: UnbalancedTransaction, newCoins: CoinInfo[]): Promise<BalancedTransaction> {
       return wallet
         .balanceTransaction(
           ZswapTransaction.deserialize(tx.serialize(getLedgerNetworkId()), getZswapNetworkId()),
           newCoins,
         )
-        .then((tx) => wallet.proveTransaction(tx))
+        .then((tx) => {
+          const prover = externalProverWallet ?? wallet;
+          return prover.proveTransaction(tx);
+        })
         .then((zswapTx) => Transaction.deserialize(zswapTx.serialize(getZswapNetworkId()), getLedgerNetworkId()))
         .then(createBalancedTx);
     },
@@ -298,6 +377,12 @@ export const buildWalletAndWaitForFunds = async (
   }
 
   const state = await Rx.firstValueFrom(wallet.state());
+  const config = new TestnetRemoteConfig();
+  const providers = await configureProviders(wallet, config);
+  const providerKey = providers.walletProvider.coinPublicKey;
+  const providerEncKey = providers.walletProvider.encryptionPublicKey;
+  console.log('providerKey', providerKey);
+  console.log('providerEncKey', providerEncKey);
   logger.info(`Your wallet seed is: ${seed}`);
   logger.info(`Your wallet address is: ${state.address}`);
   let balance = state.balances[nativeToken()];
@@ -308,6 +393,39 @@ export const buildWalletAndWaitForFunds = async (
   }
   logger.info(`Your wallet balance is: ${balance}`);
   return wallet;
+};
+
+export const buildProverWalletFromSeed = async (
+  { indexer, indexerWS, node, proofServer }: Config,
+  seed: string,
+): Promise<Wallet & Resource> => {
+  logger.info('Building prover wallet from seed (no funds required)...');
+  const wallet = await WalletBuilder.buildFromSeed(
+    indexer,
+    indexerWS,
+    proofServer,
+    node,
+    seed,
+    getZswapNetworkId(),
+    'info',
+  );
+  wallet.start();
+  await waitForSyncProgress(wallet);
+  logger.info('Prover wallet is ready for signing.');
+  return wallet;
+};
+
+export const setExternalProverWallet = async (wallet: (Wallet & Resource) | null) => {
+  externalProverWallet = wallet;
+  if (wallet === null) {
+    overrideKeys = {};
+    return;
+  }
+  const state = await Rx.firstValueFrom(wallet.state());
+  overrideKeys = {
+    coinPublicKey: state.coinPublicKey,
+    encryptionPublicKey: state.encryptionPublicKey,
+  };
 };
 
 export const randomBytes = (length: number): Uint8Array => {

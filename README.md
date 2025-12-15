@@ -1,8 +1,15 @@
-# Counter DApp
+# Summary
 
-[![Generic badge](https://img.shields.io/badge/Compact%20Compiler-0.25.0-1abc9c.svg)](https://shields.io/) [![Generic badge](https://img.shields.io/badge/TypeScript-5.8.3-blue.svg)](https://shields.io/)
+This code snippet intends to run on the Midnight ZKPaas TEE environment set by BCW under the GCP cloud service.
+It should work to fullfill the augmented functionality of `Sponsored Wallet`, where it receives a zk-proof and submits it to the chain internally.
 
-A Midnight smart contract example demonstrating counter functionality with zero-knowledge proofs on testnet.
+It should be able to do the following 4 things:
+
+  - Expose a REST endpoint to be consumed internally that accepts a Zk-proof (with wallet signed identify) from the proof-server.
+  - Accepts a zk-proof submission with a wallet pre-attached for identity of the transaction.
+  - Connects to an internal wallet with DUST attached (topped up by Midnight).
+  - Submits the proof to the chain and returns the result after checking through an internal RPC service.
+
 
 ## Project Structure
 
