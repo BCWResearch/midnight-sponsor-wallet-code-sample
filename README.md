@@ -10,6 +10,142 @@ It should be able to do the following 4 things:
   - Connects to an internal wallet with DUST attached (topped up by Midnight).
   - Submits the proof to the chain and returns the result after checking through an internal RPC service.
 
+## Sponsor Wallet Pattern - Technical Implementation
+
+The sponsor wallet pattern allows a funded wallet to pay transaction fees on behalf of another wallet (prover) that owns the contract state. This enables users without funds to interact with smart contracts.
+
+### Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         MIDNIGHT PROVIDER                                │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│   coinPublicKey  ───────────►  PROVER WALLET (overrideKeys)             │
+│   encryptionPublicKey  ─────►  (owns contract state per-user)           │
+│                                                                         │
+│   balanceTx()  ─────────────►  SPONSOR WALLET (pays fees)               │
+│       └─► proveTransaction()►  PROVER WALLET (signs proof)              │
+│   submitTx()   ─────────────►  SPONSOR WALLET (submits to chain)        │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Smart Contract Design
+
+The counter contract uses a per-user counter map keyed by `ZswapCoinPublicKey`:
+
+```compact
+export ledger counters: Map<ZswapCoinPublicKey, Counter>;
+
+export circuit increment(): [] {
+  const caller = ownPublicKey();
+  if (!counters.member(caller)) {
+    counters.insertDefault(caller);
+  }
+  counters.lookup(caller).increment(1);
+}
+```
+
+Each user has their own isolated counter, identified by their coin public key.
+
+### Core Functions
+
+| Function | Purpose |
+|----------|---------|
+| `buildWalletAndWaitForFunds()` | Builds sponsor wallet, waits for sync and funds |
+| `buildProverWalletFromSeed()` | Builds prover wallet from seed (no funds required) |
+| `setExternalProverWallet()` | Sets prover wallet and overrides keys for signing |
+| `createWalletAndMidnightProvider()` | Provider with dynamic key override support |
+| `getCounterLedgerState()` | Query counter for specific public key |
+| `displayCounterValue()` | Display counter for any wallet address |
+
+### How It Works
+
+1. **Sponsor Wallet**: Primary wallet with funds - handles `balanceTx()` and `submitTx()`
+2. **Prover Wallet**: Built from seed when needed - provides keys and signs proofs
+3. **Key Override**: `setExternalProverWallet()` overrides `coinPublicKey` and `encryptionPublicKey`
+4. **Proving**: `balanceTx()` uses `externalProverWallet ?? wallet` for `proveTransaction()`
+
+### Key Implementation Details
+
+```typescript
+// Global state for sponsor pattern
+let externalProverWallet: (Wallet & Resource) | null = null;
+let overrideKeys: { coinPublicKey?: CoinPublicKey; encryptionPublicKey?: EncPublicKey } = {};
+
+// Provider uses getters that check override keys
+export const createWalletAndMidnightProvider = async (wallet: Wallet) => {
+  const state = await Rx.firstValueFrom(wallet.state());
+  const baseCoinPublicKey = state.coinPublicKey;
+  const baseEncryptionPublicKey = state.encryptionPublicKey;
+  
+  return {
+    get coinPublicKey() {
+      return overrideKeys.coinPublicKey ?? baseCoinPublicKey;
+    },
+    get encryptionPublicKey() {
+      return overrideKeys.encryptionPublicKey ?? baseEncryptionPublicKey;
+    },
+    balanceTx(tx, newCoins) {
+      return wallet.balanceTransaction(...)
+        .then((tx) => {
+          const prover = externalProverWallet ?? wallet;
+          return prover.proveTransaction(tx);  // Prover signs
+        })
+        .then(...);
+    },
+    submitTx(tx) {
+      return wallet.submitTransaction(tx);  // Sponsor submits
+    },
+  };
+};
+
+// Set external prover and override keys
+export const setExternalProverWallet = async (wallet) => {
+  externalProverWallet = wallet;
+  if (wallet === null) {
+    overrideKeys = {};
+    return;
+  }
+  const state = await Rx.firstValueFrom(wallet.state());
+  overrideKeys = {
+    coinPublicKey: state.coinPublicKey,
+    encryptionPublicKey: state.encryptionPublicKey,
+  };
+};
+```
+
+### CLI Usage Flow
+
+```bash
+cd counter-cli && npm run build && npm run testnet-remote
+```
+
+**Interactive Flow:**
+
+1. **Build Sponsor Wallet**: Choose option 1/2/3 to create wallet with funds
+2. **Deploy or Join Contract**: Deploy new or join existing contract
+3. **Increment with Prover**:
+   - Enter private seed to sign with external wallet (prover)
+   - Or leave empty to use sponsor wallet
+4. **Display Counter**:
+   - Enter wallet address (`mn_shield-*`, `shield-cpk`, hex) to query
+   - Or press enter to query your own counter
+
+```
+You can do one of the following:
+  1. Increment
+  2. Display current counter value
+  3. Exit
+Which would you like to do? 1
+Enter private seed to sign increment (leave empty to use current wallet): <prover_seed>
+
+Which would you like to do? 2
+Enter wallet public address (mn_shield-*, shield-cpk, hex) or press enter to use your own: <address>
+```
+```
+
 
 ## Project Structure
 
@@ -164,18 +300,18 @@ If this fails with "Could not find a working container runtime strategy", use Op
 Open a new terminal (keep proof server running in the first one).
 
 ```bash
-cd counter-cli && npm run start-testnet-remote
+cd counter-cli && npm run build && npm run testnet-remote
 ```
 
 ## Using the Counter DApp
 
-### Create a Wallet
+### Step 1: Create Sponsor Wallet
 
 The CLI uses a headless wallet (separate from browser wallets like Lace) that can be called through library functions.
 
-1. Choose option `1` to build a fresh wallet
+1. Choose option `1` to build a fresh wallet (sponsor wallet with funds)
 2. The system will generate a wallet address and seed
-3. **Save both the address and seed** - you'll need them later
+3. **Save both the address and seed** - the sponsor wallet needs funds
 
 Expected output:
 
@@ -185,9 +321,9 @@ Your wallet address is: mn_shield-addr_test1...
 Your wallet balance is: 0
 ```
 
-### Fund Your Wallet
+### Step 2: Fund Sponsor Wallet
 
-Before deploying contracts, you need testnet tokens.
+Before deploying contracts, the sponsor wallet needs testnet tokens.
 
 1. Copy your wallet address from the output above
 2. Visit the [testnet faucet](https://midnight.network/test-faucet)
@@ -200,7 +336,7 @@ Expected output:
 Your wallet balance is: 1000000000
 ```
 
-### Deploy Your Contract
+### Step 3: Deploy Contract
 
 1. Choose option `1` to deploy a new counter contract
 2. Wait for deployment (takes ~30 seconds)
@@ -212,24 +348,42 @@ Expected output:
 Deployed contract at address: [contract address]
 ```
 
-### Interact with Your Contract
+### Step 4: Use Sponsor Pattern
 
-You can now:
+Once the contract is deployed, you can use the sponsor wallet pattern:
 
-- **Increment** the counter (submits a transaction to testnet)
-- **Display** current counter value (queries the blockchain)
-- **Exit** when done
+**Increment with External Prover:**
+```
+Which would you like to do? 1
+Enter private seed to sign increment (leave empty to use current wallet): <prover_64_char_hex_seed>
+```
+- The prover seed signs the transaction (owns the counter)
+- The sponsor wallet pays the fees
+- The counter is incremented for the prover's public key
 
-Each increment creates a real transaction on Midnight Testnet.
+**Query Any User's Counter:**
+```
+Which would you like to do? 2
+Enter wallet public address (mn_shield-*, shield-cpk, hex) or press enter to use your own: <address>
+Current counter value: 5
+```
 
-### Reusing Your Wallet
+### Per-User Counter Isolation
+
+Each user's counter is isolated by their `coinPublicKey`. When a prover signs an increment:
+- Their public key is used to identify their counter in the map
+- Only their counter is incremented
+- Other users' counters remain unchanged
+
+### Reusing Wallets
 
 Next time you run the DApp:
 
-1. Choose option `2` to build wallet from seed
-2. Enter your saved seed
+1. Choose option `2` to build wallet from seed (sponsor)
+2. Enter your saved sponsor seed
 3. Choose option `2` to join existing contract
 4. Enter your saved contract address
+5. Use prover seeds to increment counters for different users
 
 ## Useful Links
 
@@ -247,3 +401,5 @@ Next time you run the DApp:
 | Tests fail with "Cannot find module"                | Compile contract first: `cd contract && npm run compact && npm run build && npm run test`                               |
 | Wallet seed validation errors                       | Enter complete 64-character hex string without extra spaces                                                             |
 | Node.js warnings about experimental features        | Normal warnings - don't affect functionality                                                                            |
+| Counter shows 0 for address                         | That address hasn't incremented yet - each user has their own counter                                                   |
+| Prover wallet sync issues                           | Prover wallet needs to sync but doesn't need funds - just wait for sync to complete                                     |
